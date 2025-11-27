@@ -1,0 +1,171 @@
+name: Build Attestable Image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write # Permission for pushing image into ghcr
+
+  # Permission to attest artifact using GitHub attestation
+  id-token: write     
+  attestations: write
+
+jobs:
+  build-and-sign:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # oras-project/setup-oras@v1.2.4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # docker/login-action@v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build KIWI builder Docker image
+        run: |
+          docker build -t kiwi-builder:latest -f .github/docker/Dockerfile.kiwi-builder .
+
+      - name: Create build output directory
+        run: mkdir -p build-output
+
+      - name: Setup loop devices on host
+        run: |
+          # Building KIWI image inside container requires loop devices
+          # See: https://osinside.github.io/kiwi/plugins/self_contained.html#building-in-container
+
+          # Ensure loop module is loaded on the host
+          sudo modprobe loop
+          # Create loop devices if they don't exist
+          for i in {0..7}; do
+            sudo mknod -m 0660 /dev/loop$i b 7 $i 2>/dev/null || true
+          done
+          # List available loop devices
+          ls -la /dev/loop* || true
+
+      - name: Run KIWI NG image build script
+        shell: bash
+        run: ${{ github.workspace }}/.github/scripts/build-kiwi-image.sh
+
+      - name: Push artifacts to GitHub Container Registry
+        id: push-artifacts
+        run: |
+          set -e
+
+          # Generate artifact tag with branch name and timestamp
+          BRANCH_NAME=$(echo "${{ github.ref_name }}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          TAG="${BRANCH_NAME}-${TIMESTAMP}"
+
+          # Get the image file name
+          IMAGE_FILE=$(ls build-output/*.raw 2>/dev/null | head -n 1)
+          if [ -z "$IMAGE_FILE" ]; then
+              echo "::error::No .raw image file found in build-output directory"
+              exit 1
+          fi
+
+          # Verify PCR measurements file exists
+          if [ ! -f "build-output/pcr_measurements.json" ]; then
+              echo "::error::PCR measurements file not found"
+              exit 1
+          fi
+
+          # Extract PCR4 and PCR7 measurements from pcr_measurements.json
+          PCR4=$(jq -r '.Measurements.PCR4' build-output/pcr_measurements.json)
+          PCR7=$(jq -r '.Measurements.PCR7' build-output/pcr_measurements.json)
+
+          # Verify PCR values were extracted successfully
+          if [ -z "$PCR4" ] || [ "$PCR4" = "null" ]; then
+              echo "::error::Failed to extract PCR4 from pcr_measurements.json"
+              exit 1
+          fi
+
+          if [ -z "$PCR7" ] || [ "$PCR7" = "null" ]; then
+              echo "::error::Failed to extract PCR7 from pcr_measurements.json"
+              exit 1
+          fi
+
+          echo "Extracted PCR measurements:"
+          echo "  PCR4: ${PCR4}"
+          echo "  PCR7: ${PCR7}"
+
+          IMAGE_BASENAME=$(basename "$IMAGE_FILE")
+
+          # Push artifacts using ORAS with PCR annotations
+          ARTIFACT_PATH="ghcr.io/${{ github.repository }}"
+          ARTIFACT_FULL_PATH="${ARTIFACT_PATH}:${TAG}"
+          if ! oras push "${ARTIFACT_FULL_PATH}" \
+            --annotation "pcr4=${PCR4}" \
+            --annotation "pcr7=${PCR7}" \
+            build-output/pcr_measurements.json:application/json \
+            "${IMAGE_FILE}:application/octet-stream"; then
+              echo "::error::ORAS push failed. Check registry permissions and network connectivity."
+              exit 1
+          fi
+
+          # Export manifest and calculate digest
+          DIGEST=$(oras manifest fetch "${ARTIFACT_FULL_PATH}" | sha256sum | cut -d' ' -f1)
+
+          # Set outputs
+          echo "digest=sha256:${DIGEST}" >> $GITHUB_OUTPUT
+          echo "path=${ARTIFACT_PATH}" >> $GITHUB_OUTPUT
+          echo "full-path=${ARTIFACT_FULL_PATH}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "pcr4=${PCR4}" >> $GITHUB_OUTPUT
+          echo "pcr7=${PCR7}" >> $GITHUB_OUTPUT
+
+      - name: Attest artifact
+        id: attest-artifact
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ steps.push-artifacts.outputs.path }}
+          subject-digest: ${{ steps.push-artifacts.outputs.digest }}
+          push-to-registry: true
+
+      - name: Create workflow summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          # Attestable Image Build Summary
+
+          ## Artifact Details
+
+          - **Digest**: \`${{ steps.push-artifacts.outputs.digest }}\`
+          - **Path**: \`${{ steps.push-artifacts.outputs.full-path }}\`
+          - **Tag**: \`${{ steps.push-artifacts.outputs.tag }}\`
+
+          ## PCR Measurements
+
+          PCR4: \`${{ steps.push-artifacts.outputs.pcr4 }}\`
+          PCR7: \`${{ steps.push-artifacts.outputs.pcr7 }}\`
+
+          ## Signature Details
+
+          - **Attestation ID**: \`${{ steps.attest-artifact.outputs.attestation-id }}\`
+          - **Attestation URL**: [View in GitHub Attestation](${{ steps.attest-artifact.outputs.attestation-url }})
+
+          ## Verification
+
+          To verify the signed artifact:
+
+          \`\`\`bash
+          gh attestation verify oci://${{ steps.push-artifacts.outputs.full-path }} -R ${{ github.repository }}
+          \`\`\`
+
+          To pull the artifact:
+
+          \`\`\`bash
+          oras pull ${{ steps.push-artifacts.outputs.path }}@${{ steps.push-artifacts.outputs.digest }}
+          \`\`\`
+          EOF

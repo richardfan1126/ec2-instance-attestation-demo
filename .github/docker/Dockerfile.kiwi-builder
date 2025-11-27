@@ -1,0 +1,28 @@
+# Dockerfile for KIWI NG builder
+# Based on Amazon Linux 2023
+
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023
+
+# Install system dependencies
+# See: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/build-sample-ami.html
+RUN dnf install -y \
+    kiwi-cli \
+    python3-kiwi \
+    kiwi-systemdeps-core \
+    python3-poetry-core \
+    qemu-img \
+    veritysetup \
+    erofs-utils \
+    git \
+    cargo \
+    aws-nitro-tpm-tools \
+    && dnf clean all
+
+# Create output directory for build artifacts
+RUN mkdir -p /output
+
+# Set working directory
+WORKDIR /workspace
+
+# Default command (can be overridden)
+CMD ["/bin/bash"]
