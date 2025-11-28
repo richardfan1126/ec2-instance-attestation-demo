@@ -58,3 +58,4 @@ ENV/
 
 # Build artifacts
 ami_build_result.json
+infrastructure_state.json
