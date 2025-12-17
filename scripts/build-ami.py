@@ -7,7 +7,7 @@ verify its signature, and transform it into an AMI.
 """
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -962,7 +962,7 @@ def main() -> int:
             "ami_id": ami_id,
             "snapshot_id": snapshot_id,
             "region": args.region,
-            "build_timestamp": datetime.now().isoformat(),
+            "build_timestamp": datetime.now(timezone.utc).isoformat(),
             "pcr_measurements": {
                 "pcr4": pcr_measurement['Measurements']['PCR4'],
                 "pcr7": pcr_measurement['Measurements']['PCR7'],

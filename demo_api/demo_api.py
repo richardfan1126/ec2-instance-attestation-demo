@@ -111,7 +111,7 @@ class AttestationAPIHandler(BaseHTTPRequestHandler):
         """
         Handle attestation document generation endpoint.
         
-        Accepts JSON payload with optional 'user_data' field.
+        Accepts JSON payload with optional 'user_data', 'nonce' fields.
         Generates attestation document using nitro-tpm-attest.
         """
         from datetime import datetime
@@ -123,6 +123,7 @@ class AttestationAPIHandler(BaseHTTPRequestHandler):
         body = None
         request_data = None
         user_data = None
+        nonce = None
         
         try:
             # Read request body
@@ -152,9 +153,12 @@ class AttestationAPIHandler(BaseHTTPRequestHandler):
             
             # Extract user data from request (optional)
             user_data = request_data.get('user_data')
+
+            # Extract nonce from request (optional)
+            nonce = request_data.get('nonce')
             
             # Generate attestation document with detailed error handling
-            result = self.generate_attestation_document(user_data)
+            result = self.generate_attestation_document(user_data, nonce)
             
             if result is None:
                 # Error already logged and sent by generate_attestation_document
@@ -212,7 +216,8 @@ class AttestationAPIHandler(BaseHTTPRequestHandler):
                     'context': {
                         'content_length': content_length,
                         'request_data_keys': list(request_data.keys()) if request_data else None,
-                        'user_data_provided': user_data is not None
+                        'user_data_provided': user_data is not None,
+                        'nonce_provided': nonce is not None
                     }
                 }
             )
@@ -229,7 +234,8 @@ class AttestationAPIHandler(BaseHTTPRequestHandler):
                     'context': {
                         'content_length': content_length,
                         'request_data_type': type(request_data).__name__ if request_data is not None else None,
-                        'user_data_type': type(user_data).__name__ if user_data is not None else None
+                        'user_data_type': type(user_data).__name__ if user_data is not None else None,
+                        'nonce_type': type(nonce).__name__ if nonce is not None else None
                     }
                 }
             )
@@ -246,7 +252,8 @@ class AttestationAPIHandler(BaseHTTPRequestHandler):
                     'context': {
                         'errno': e.errno if hasattr(e, 'errno') else None,
                         'filename': e.filename if hasattr(e, 'filename') else None,
-                        'user_data_provided': user_data is not None
+                        'user_data_provided': user_data is not None,
+                        'nonce_provided': nonce is not None
                     }
                 }
             )
@@ -282,17 +289,23 @@ class AttestationAPIHandler(BaseHTTPRequestHandler):
                         'method': 'POST',
                         'content_length': content_length,
                         'request_data_available': request_data is not None,
-                        'user_data_provided': user_data is not None
+                        'user_data_provided': user_data is not None,
+                        'nonce_provided': nonce is not None
                     }
                 }
             )
     
-    def generate_attestation_document(self, user_data: Optional[str] = None) -> Optional[tuple]:
+    def generate_attestation_document(
+            self,
+            user_data: Optional[str] = None,
+            nonce: Optional[str] = None
+        ) -> Optional[tuple]:
         """
         Generate attestation document using nitro-tpm-attest.
         
         Args:
             user_data: Optional user data
+            nonce: Optional nonce
         
         Returns:
             Tuple of (attestation_document, error_details) where:
@@ -315,6 +328,18 @@ class AttestationAPIHandler(BaseHTTPRequestHandler):
                     raise
                 
                 logger.info(f"User data saved to temporary file: {temp_userdata_file}")
+
+            # If nonce provided, save it to a temporary file
+            if nonce:
+                fd, temp_nonce_file = tempfile.mkstemp(suffix='.txt', prefix='nonce-')
+                try:
+                    with os.fdopen(fd, 'w') as f:
+                        f.write(nonce)
+                except Exception:
+                    os.close(fd)
+                    raise
+                
+                logger.info(f"Nonce saved to temporary file: {temp_nonce_file}")
             
             # Build nitro-tpm-attest command
             cmd = ['/usr/bin/nitro-tpm-attest']
@@ -322,6 +347,10 @@ class AttestationAPIHandler(BaseHTTPRequestHandler):
             # If user data provided, pass it to the command
             if user_data:
                 cmd.extend(['--user-data', temp_userdata_file])
+
+            # If nonce provided, pass it to the command
+            if nonce:
+                cmd.extend(['--nonce', temp_nonce_file])
             
             logger.info(f"Executing: {' '.join(cmd)}")
             
@@ -354,7 +383,9 @@ class AttestationAPIHandler(BaseHTTPRequestHandler):
                     'timestamp': datetime.utcnow().isoformat() + 'Z',
                     'context': {
                         'user_data_provided': user_data is not None,
-                        'temp_userdata_file': temp_userdata_file
+                        'temp_userdata_file': temp_userdata_file,
+                        'nonce_provided': nonce is not None,
+                        'temp_nonce_file': temp_nonce_file
                     }
                 }
                 
@@ -383,7 +414,9 @@ class AttestationAPIHandler(BaseHTTPRequestHandler):
                 'timestamp': datetime.utcnow().isoformat() + 'Z',
                 'context': {
                     'user_data_provided': user_data is not None,
-                    'temp_userdata_file': temp_userdata_file
+                    'temp_userdata_file': temp_userdata_file,
+                    'nonce_provided': nonce is not None,
+                    'temp_nonce_file': temp_nonce_file
                 }
             }
             return (None, error_details)
@@ -396,7 +429,9 @@ class AttestationAPIHandler(BaseHTTPRequestHandler):
                 'timestamp': datetime.utcnow().isoformat() + 'Z',
                 'context': {
                     'user_data_provided': user_data is not None,
-                    'temp_userdata_file': temp_userdata_file
+                    'temp_userdata_file': temp_userdata_file,
+                    'nonce_provided': nonce is not None,
+                    'temp_nonce_file': temp_nonce_file
                 }
             }
             return (None, error_details)
