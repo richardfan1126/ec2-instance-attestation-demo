@@ -18,6 +18,8 @@ import logging
 from pathlib import Path
 import sys
 import time
+import random
+import string
 from typing import Optional, Tuple
 
 import requests
@@ -50,6 +52,7 @@ class AttestationValidationResult:
     certificate_chain_valid: bool
     pcr4_match: bool
     pcr7_match: bool
+    nonce_match: bool
     error_message: Optional[str] = None
     
     @property
@@ -62,12 +65,14 @@ class AttestationValidationResult:
         - Certificate chain is valid
         - PCR4 measurement matches reference
         - PCR7 measurement matches reference
+        - Nonce matches reference
         """
         return (
             self.signature_valid and 
             self.certificate_chain_valid and 
             self.pcr4_match and 
-            self.pcr7_match
+            self.pcr7_match and
+            self.nonce_match
         )
     
     def display(self) -> None:
@@ -81,17 +86,20 @@ class AttestationValidationResult:
         status_chain = "VALID" if self.certificate_chain_valid else "INVALID"
         status_pcr4 = "MATCH" if self.pcr4_match else "MISMATCH"
         status_pcr7 = "MATCH" if self.pcr7_match else "MISMATCH"
+        status_nonce = "MATCH" if self.nonce_match else "MISMATCH"
         
         # Use visual indicators (checkmark for valid, X for invalid)
         symbol_signature = "✓" if self.signature_valid else "✗"
         symbol_chain = "✓" if self.certificate_chain_valid else "✗"
         symbol_pcr4 = "✓" if self.pcr4_match else "✗"
         symbol_pcr7 = "✓" if self.pcr7_match else "✗"
+        symbol_nonce = "✓" if self.nonce_match else "✗"
         
         print(f"{symbol_signature} COSE Signature:      {status_signature}")
         print(f"{symbol_chain} Certificate Chain:   {status_chain}")
         print(f"{symbol_pcr4} PCR4 Measurement:    {status_pcr4}")
         print(f"{symbol_pcr7} PCR7 Measurement:    {status_pcr7}")
+        print(f"{symbol_nonce} Nonce:               {status_nonce}")
         print()
         
         # Display overall status
@@ -106,7 +114,6 @@ class AttestationValidationResult:
             print(f"✗ Error: {self.error_message}")
         
         print("=" * 80)
-
 
 @dataclass
 class ParsedAttestationDocument:
@@ -177,8 +184,8 @@ class ParsedAttestationDocument:
         
         # Additional Fields
         print("Additional Fields:")
-        print(f"  User Data: {self.user_data.hex() if self.user_data else 'null'}")
-        print(f"  Nonce: {self.nonce.hex() if self.nonce else 'null'}")
+        print(f"  User Data: {self.user_data.decode() if self.user_data else 'null'}")
+        print(f"  Nonce: {self.nonce.decode() if self.nonce else 'null'}")
         print()
         print("=" * 80)
     
@@ -237,6 +244,7 @@ class ParsedAttestationDocument:
 
 def request_attestation_document(
     api_url: str,
+    nonce: str,
     max_attempts: int = 5
 ) -> bytes:
     """
@@ -257,7 +265,9 @@ def request_attestation_document(
     
     
     endpoint = f"{api_url}/attest"
-    payload = {}
+    payload = {
+        "nonce": nonce
+    }
     
     for attempt in range(1, max_attempts + 1):
         try:
@@ -352,7 +362,6 @@ def _parse_error_response(response: requests.Response) -> str:
         # Fall back to raw text if JSON parsing fails
         return response.text
 
-
 def _format_detailed_error(error_data: dict) -> str:
     """
     Format detailed error information from API response for user-friendly display.
@@ -431,6 +440,29 @@ def _format_detailed_error(error_data: dict) -> str:
     
     return summary
 
+def _extract_attestation_data(attestation_document: bytes) -> dict:
+    """
+    Extract attestation data from attestation document bytes
+
+    Args:
+        attestation_document (bytes): Attestation document
+
+    Returns:
+        dict: attestation data
+    """
+    # Decode COSE structure (CBOR list: [protected, unprotected, payload, signature])
+    cose_structure = cbor2.loads(attestation_document)
+    
+    if not isinstance(cose_structure, list) or len(cose_structure) != 4:
+        logger.warning("Attestation document is not a valid COSE structure")
+        return False, False
+    
+    # Extract the payload (the actual attestation document)
+    payload = cose_structure[2]
+    attestation_data = cbor2.loads(payload)
+
+    return attestation_data
+
 def compare_pcr_measurements(
     attestation_document: bytes,
     reference_measurements: dict
@@ -452,16 +484,7 @@ def compare_pcr_measurements(
     logger.info("Comparing PCR measurements...")
     
     try:
-        # Decode COSE structure (CBOR list: [protected, unprotected, payload, signature])
-        cose_structure = cbor2.loads(attestation_document)
-        
-        if not isinstance(cose_structure, list) or len(cose_structure) != 4:
-            logger.warning("Attestation document is not a valid COSE structure")
-            return False, False
-        
-        # Extract the payload (the actual attestation document)
-        payload = cose_structure[2]
-        attestation_data = cbor2.loads(payload)
+        attestation_data = _extract_attestation_data(attestation_document)
         
         # Extract PCR measurements (NitroTPM uses 'nitrotpm_pcrs')
         if 'nitrotpm_pcrs' not in attestation_data:
@@ -499,6 +522,51 @@ def compare_pcr_measurements(
         logger.info(f"  Match:     {'YES' if pcr7_match else 'NO'}")
         
         return pcr4_match, pcr7_match
+        
+    except Exception as e:
+        logger.error(f"Failed to parse attestation document: {e}")
+        return False, False
+
+def compare_nonce(
+    attestation_document: bytes,
+    reference_nonce: str
+) -> bool:
+    """
+    Compare nonce from attestation document with reference values.
+    
+    Args:
+        attestation_document: CBOR-encoded attestation document
+        reference_nonce: Reference nonce
+    
+    Returns:
+        True if nonce match, False otherwise
+    """
+    logger.info("Comparing Nonce...")
+    
+    try:
+        attestation_data = _extract_attestation_data(attestation_document)
+        
+        # Extract nonce
+        if 'nonce' not in attestation_data:
+            logger.warning("Attestation document missing 'nonce' field")
+            return False, False
+        
+        nonce = attestation_data['nonce']
+
+        try:
+            decoded_nonce = nonce.decode()
+        except Exception as e:
+            raise RuntimeError(f"Failed decoding nonce: {e}")
+        
+        # Compare with reference nonce
+        nonce_match = reference_nonce == decoded_nonce
+        
+        logger.info(f"Nonce Comparison:")
+        logger.info(f"  Reference: {reference_nonce}")
+        logger.info(f"  Actual:    {decoded_nonce}")
+        logger.info(f"  Match:     {'YES' if nonce_match else 'NO'}")
+        
+        return nonce_match
         
     except Exception as e:
         logger.error(f"Failed to parse attestation document: {e}")
@@ -760,7 +828,8 @@ def validate_certificate_chain(certificate: bytes, cabundle: list) -> bool:
 
 def validate_attestation_document(
     attestation_document: bytes,
-    reference_measurements: dict
+    reference_measurements: dict,
+    nonce: str
 ) -> AttestationValidationResult:
     """
     Orchestrate the complete attestation document validation process.
@@ -774,6 +843,7 @@ def validate_attestation_document(
     Args:
         attestation_document: Raw CBOR-encoded COSE attestation document
         reference_measurements: Reference PCR measurements from AMI build
+        nonce: The generated nonce that was sent to the API
     
     Returns:
         AttestationValidationResult with all validation results
@@ -810,6 +880,7 @@ def validate_attestation_document(
                 certificate_chain_valid=False,
                 pcr4_match=False,
                 pcr7_match=False,
+                nonce_match=False,
                 error_message=error_message
             )
         except Exception as e:
@@ -820,6 +891,7 @@ def validate_attestation_document(
                 certificate_chain_valid=False,
                 pcr4_match=False,
                 pcr7_match=False,
+                nonce_match=False,
                 error_message=error_message
             )
         
@@ -896,6 +968,33 @@ def validate_attestation_document(
             pcr7_match = False
             if not error_message:
                 error_message = error_msg
+
+        # Compare nonce
+        logger.info("")
+        logger.info("Comparing Nonce")
+        logger.info("-" * 80)
+        
+        try:
+            nonce_match = compare_nonce(
+                attestation_document,
+                nonce
+            )
+            
+            if nonce_match:
+                logger.info("✓ Nonce comparison: PASSED")
+            else:
+                logger.error("✗ Nonce comparison: FAILED")
+                if not error_message:
+                    error_message = "Nonce do not match reference values"
+                    
+        except Exception as e:
+            error_msg = f"Error during PCR comparison: {e}"
+            logger.error(f"✗ {error_msg}", exc_info=True)
+            pcr4_match = False
+            pcr7_match = False
+            if not error_message:
+                error_message = error_msg
+
         
         # Create and return validation result
         validation_result = AttestationValidationResult(
@@ -903,6 +1002,7 @@ def validate_attestation_document(
             certificate_chain_valid=certificate_chain_valid,
             pcr4_match=pcr4_match,
             pcr7_match=pcr7_match,
+            nonce_match=nonce_match,
             error_message=error_message
         )
         
@@ -924,8 +1024,22 @@ def validate_attestation_document(
             certificate_chain_valid=certificate_chain_valid,
             pcr4_match=pcr4_match,
             pcr7_match=pcr7_match,
+            nonce_match=nonce_match,
             error_message=error_message
         )
+
+def generate_nonce(length: int = 8) -> str:
+    """
+    Generate random nonce
+
+    rgs:
+        length: Length of nonce (default 8)
+
+    Returns:
+        str: nonce
+    """
+
+    return ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(length))
 
 def parse_arguments() -> argparse.Namespace:
     """Parse command-line arguments."""
@@ -1006,6 +1120,16 @@ def main() -> int:
         logger.info(f"Attestation API URL: {infrastructure_state['attestation_api_url']}")
         logger.info(f"Reference PCR4: {ami_build_result['pcr_measurements']['pcr4'][:32]}...{ami_build_result['pcr_measurements']['pcr4'][-32:]}")
         logger.info(f"Reference PCR7: {ami_build_result['pcr_measurements']['pcr7'][:32]}...{ami_build_result['pcr_measurements']['pcr7'][-32:]}")
+
+        # Generate random nonce
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("Generating Random Nonce")
+        logger.info("=" * 80)
+
+        nonce = generate_nonce()
+
+        logger.info(f"Generated nonce: {nonce}")
         
         # Request attestation document via HTTP API
         logger.info("")
@@ -1014,7 +1138,8 @@ def main() -> int:
         logger.info("=" * 80)
         
         attestation_document = request_attestation_document(
-            infrastructure_state['attestation_api_url']
+            infrastructure_state['attestation_api_url'],
+            nonce
         )
         
         # Save attestation document to file
@@ -1048,7 +1173,8 @@ def main() -> int:
         
         validation_result = validate_attestation_document(
             attestation_document,
-            ami_build_result['pcr_measurements']
+            ami_build_result['pcr_measurements'],
+            nonce
         )
         
         # Display validation summary
@@ -1060,7 +1186,6 @@ def main() -> int:
             logger.error("=" * 80)
             logger.error("ATTESTATION VALIDATION FAILED")
             logger.error("=" * 80)
-            logger.error("Cannot proceed with KMS encryption/decryption")
             logger.error("The attestation document did not pass validation checks")
             logger.error("=" * 80)
             
