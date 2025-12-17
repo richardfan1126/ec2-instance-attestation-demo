@@ -476,7 +476,7 @@ def install_coldsnap(ssh_client: paramiko.SSHClient) -> None:
     else:
         raise RuntimeError("Failed to verify coldsnap installation")
 
-def pull_artifact_from_ghcr(ssh_client: paramiko.SSHClient, artifact_ref: str) -> None:
+def pull_artifact_from_ghcr(ssh_client: paramiko.SSHClient, artifact_ref: str) -> dict:
     """
     Pull artifact bundle from GitHub Container Registry using ORAS.
     
@@ -486,6 +486,9 @@ def pull_artifact_from_ghcr(ssh_client: paramiko.SSHClient, artifact_ref: str) -
     Args:
         ssh_client: Connected paramiko SSHClient
         artifact_ref: GitHub Container Registry artifact reference
+    
+    Returns:
+        Dictionray of PCR measurements of the image
     """
     logger.info(f"Pulling artifact from GHCR: {artifact_ref}")
     
@@ -543,6 +546,22 @@ def pull_artifact_from_ghcr(ssh_client: paramiko.SSHClient, artifact_ref: str) -
         raise RuntimeError("Raw disk image (.raw file) not found in build-output directory")
     
     logger.info("All required artifacts verified successfully")
+
+    exit_code, stdout, _ = execute_remote_command(
+        ssh_client,
+        "cat ~/artifacts/build-output/pcr_measurements.json",
+        stream_output=False
+    )
+    
+    if exit_code != 0:
+        raise RuntimeError("Failed getting pcr_measurements.json content")
+    
+    try:
+        pcr_measurements = json.loads(stdout)
+    except Exception as e:
+        raise RuntimeError(f"Failed parsing pcr_measurements.json content: {e}")
+
+    return pcr_measurements
 
 def verify_artifact_signature(
     ssh_client: paramiko.SSHClient,
@@ -798,7 +817,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '--region',
         type=str,
-        required=True,
+        default='us-east-1',
         help='AWS region for AMI creation (e.g., us-east-1)'
     )
     
@@ -908,12 +927,13 @@ def main() -> int:
             raise RuntimeError("SIGNATURE VERIFICATION FAILED")
 
         # Pull artifact from GHCR
+        # Get PCR measurements from artifact
         logger.info("")
         logger.info("=" * 80)
         logger.info("Pulling Artifact from GitHub Container Registry")
         logger.info("=" * 80)
         
-        pull_artifact_from_ghcr(ssh_client, args.artifact_ref)
+        pcr_measurement = pull_artifact_from_ghcr(ssh_client, args.artifact_ref)
 
         # Upload snapshot and register AMI
         logger.info("")
@@ -942,7 +962,11 @@ def main() -> int:
             "ami_id": ami_id,
             "snapshot_id": snapshot_id,
             "region": args.region,
-            "build_timestamp": datetime.now().isoformat()
+            "build_timestamp": datetime.now().isoformat(),
+            "pcr_measurements": {
+                "pcr4": pcr_measurement['Measurements']['PCR4'],
+                "pcr7": pcr_measurement['Measurements']['PCR7'],
+            }
         }
 
         with open(args.output_file, 'w') as f:

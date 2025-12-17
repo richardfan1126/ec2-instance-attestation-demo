@@ -4,5 +4,9 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "boto3>=1.41.5",
+    "cbor2>=5.7.1",
+    "cryptography>=41.0.0",
     "paramiko>=4.0.0",
+    "pyopenssl>=25.3.0",
+    "requests>=2.31.0",
 ]
